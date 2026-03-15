@@ -1,0 +1,4 @@
+interface:
+  display_name: "Google Jules Control"
+  short_description: "Google Jules 세션을 시작하고 이어서 제어합니다"
+  default_prompt: "Use $google-jules-control to start or continue a Jules coding session, send the next instruction, and summarize the latest status."

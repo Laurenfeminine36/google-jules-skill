@@ -1,0 +1,1312 @@
+#!/usr/bin/env python3
+"""Minimal CLI for the Jules REST API."""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from typing import Any
+
+DEFAULT_BASE_URL = os.environ.get("JULES_API_BASE_URL", "https://jules.googleapis.com/v1alpha")
+DEFAULT_TIMEOUT_SECONDS = 60 * 20
+ACTIVE_STATES = {"QUEUED", "PLANNING", "IN_PROGRESS", "PAUSED"}
+WAITING_STATES = {"AWAITING_PLAN_APPROVAL", "AWAITING_USER_FEEDBACK"}
+TERMINAL_STATES = {"FAILED", "COMPLETED"}
+OPEN_STATES = ACTIVE_STATES | WAITING_STATES
+PR_URL_RE = re.compile(r"https://github\.com/[^/\s]+/[^/\s]+/pull/\d+")
+CLOSE_CONFIRM_TOKEN = "CLOSE_MERGED_SESSION"
+ENV_FILE_CANDIDATES = [
+    Path.cwd() / ".env",
+    Path(__file__).resolve().parent.parent / ".env",
+]
+
+
+def fail(message: str, exit_code: int = 1) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(exit_code)
+
+
+def find_dotenv_path() -> Path | None:
+    for candidate in ENV_FILE_CANDIDATES:
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def load_dotenv() -> None:
+    dotenv_path = find_dotenv_path()
+    if dotenv_path is None:
+        return
+    for raw_line in dotenv_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip("'").strip('"')
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+def get_api_key() -> str:
+    api_key = os.environ.get("JULES_API_KEY", "").strip()
+    if not api_key:
+        fail("JULES_API_KEY is required. Put it in a .env file or export it in the shell first.")
+    return api_key
+
+
+def normalize_session_name(value: str) -> str:
+    value = value.strip()
+    if not value:
+        fail("Session identifier is required.")
+    if value.startswith("sessions/"):
+        return value
+    return f"sessions/{value}"
+
+
+def build_url(path: str, query: dict[str, Any] | None = None) -> str:
+    path = path if path.startswith("/") else f"/{path}"
+    url = f"{DEFAULT_BASE_URL}{path}"
+    if query:
+        filtered = {key: value for key, value in query.items() if value not in (None, "", False)}
+        if filtered:
+            url = f"{url}?{urllib.parse.urlencode(filtered)}"
+    return url
+
+
+def api_request(method: str, path: str, *, payload: dict[str, Any] | None = None, query: dict[str, Any] | None = None) -> Any:
+    headers = {
+        "x-goog-api-key": get_api_key(),
+        "Accept": "application/json",
+    }
+    data = None
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(build_url(path, query), data=data, headers=headers, method=method.upper())
+    try:
+        with urllib.request.urlopen(request) as response:
+            raw = response.read().decode("utf-8").strip()
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace").strip()
+        details = body or exc.reason
+        fail(f"Jules API request failed: {exc.code} {details}")
+    except urllib.error.URLError as exc:
+        fail(f"Jules API request failed: {exc.reason}")
+
+    if not raw:
+        return {}
+    return json.loads(raw)
+
+
+def collect_paginated_resources(
+    path: str,
+    *,
+    page_size: int,
+    resource_key: str,
+    page_token: str | None = None,
+    extra_query: dict[str, Any] | None = None,
+) -> tuple[list[dict[str, Any]], str | None]:
+    resources: list[dict[str, Any]] = []
+    next_token = page_token
+    first_iteration = True
+
+    while first_iteration or next_token:
+        first_iteration = False
+        query = {"pageSize": page_size}
+        if next_token:
+            query["pageToken"] = next_token
+        if extra_query:
+            query.update(extra_query)
+        response = api_request("GET", path, query=query)
+        resources.extend(response.get(resource_key, []))
+        next_token = response.get("nextPageToken")
+
+    return resources, next_token
+
+
+def print_json(data: Any) -> None:
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def print_text(value: str) -> None:
+    print(value.rstrip())
+
+
+def parse_rfc3339(value: str | None) -> dt.datetime | None:
+    if not value:
+        return None
+    normalized = value.replace("Z", "+00:00")
+    try:
+        return dt.datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
+def utc_now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def extract_repo_name(session: dict[str, Any]) -> str | None:
+    source_context = session.get("sourceContext", {})
+    source = source_context.get("source")
+    if isinstance(source, str) and source:
+        return source.removeprefix("sources/github/")
+    return None
+
+
+def session_matches_repo_filter(session: dict[str, Any], repo_filter: str | None) -> bool:
+    if not repo_filter:
+        return True
+    return extract_repo_name(session) == repo_filter.strip()
+
+
+def collect_gh_auth_status() -> dict[str, Any]:
+    available = gh_is_available()
+    payload: dict[str, Any] = {
+        "installed": available,
+        "authenticated": False,
+    }
+    if not available:
+        payload["reason"] = "gh CLI is not installed."
+        return payload
+
+    try:
+        result = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True, check=True)
+        payload["authenticated"] = True
+        payload["stdout"] = result.stdout.strip()
+    except subprocess.CalledProcessError as exc:
+        payload["stdout"] = (exc.stdout or "").strip()
+        payload["stderr"] = (exc.stderr or "").strip()
+    return payload
+
+
+def collect_jules_cli_status() -> dict[str, Any]:
+    cli_path = shutil.which("jules")
+    payload: dict[str, Any] = {
+        "installed": bool(cli_path),
+        "path": cli_path,
+    }
+    if not cli_path:
+        return payload
+
+    try:
+        result = subprocess.run(["jules", "--version"], capture_output=True, text=True, check=True)
+        payload["version"] = (result.stdout or result.stderr).strip()
+    except subprocess.CalledProcessError as exc:
+        payload["versionError"] = (exc.stderr or exc.stdout).strip()
+    return payload
+
+
+def format_session_line(session: dict[str, Any]) -> str:
+    repo = session.get("repo") or "-"
+    title = session.get("title") or "(untitled)"
+    state = session.get("state") or "STATE_UNSPECIFIED"
+    return f"- {session.get('name')} [{state}] {repo} :: {title}"
+
+
+def format_cleanup_report_markdown(payload: dict[str, Any]) -> str:
+    lines = [
+        "# Jules Cleanup Report",
+        "",
+        f"- Total scanned: {payload['summary']['totalSessionsScanned']}",
+        f"- Merged candidates: {payload['summary']['mergedCandidateCount']}",
+        f"- Unmerged: {payload['summary']['unmergedCount']}",
+        f"- Without PR: {payload['summary']['withoutPrCount']}",
+        "",
+        "## Merged Candidates",
+    ]
+    merged = payload.get("mergedCandidates", [])
+    if merged:
+        lines.extend(format_session_line(item) for item in merged)
+    else:
+        lines.append("- none")
+
+    lines.extend(["", "## Unmerged Sessions"])
+    unmerged = payload.get("unmergedSessions", [])
+    if unmerged:
+        lines.extend(format_session_line(item) for item in unmerged)
+    else:
+        lines.append("- none")
+
+    lines.extend(["", "## Without Pull Request"])
+    without_pr = payload.get("withoutPullRequest", [])
+    if without_pr:
+        lines.extend(format_session_line(item) for item in without_pr)
+    else:
+        lines.append("- none")
+    return "\n".join(lines)
+
+
+def format_cleanup_report_compact(payload: dict[str, Any]) -> str:
+    summary = payload["summary"]
+    return (
+        f"scanned={summary['totalSessionsScanned']} "
+        f"merged_candidates={summary['mergedCandidateCount']} "
+        f"unmerged={summary['unmergedCount']} "
+        f"without_pr={summary['withoutPrCount']}"
+    )
+
+
+def format_close_ready_markdown(payload: dict[str, Any]) -> str:
+    lines = [
+        "# Jules Close-Ready Report",
+        "",
+        f"- Candidates: {payload['summary']['candidateCount']}",
+        "",
+    ]
+    for item in payload.get("candidates", []):
+        lines.append(f"## {item.get('title') or item.get('name')}")
+        lines.append(format_session_line(item))
+        lines.append(f"- Close command: `{item.get('recommendedCommand')}`")
+        lines.append(f"- Notify message: {item.get('message')}")
+        lines.append("")
+    if not payload.get("candidates"):
+        lines.append("- none")
+    return "\n".join(lines)
+
+
+def format_close_ready_compact(payload: dict[str, Any]) -> str:
+    summary = payload["summary"]
+    return f"candidates={summary['candidateCount']}"
+
+
+def emit_output(payload: dict[str, Any], *, compact: bool = False, markdown: bool = False, compact_formatter=None, markdown_formatter=None) -> None:
+    if markdown and markdown_formatter:
+        print_text(markdown_formatter(payload))
+        return
+    if compact and compact_formatter:
+        print_text(compact_formatter(payload))
+        return
+    print_json(payload)
+
+
+def list_active_sessions(args: argparse.Namespace) -> None:
+    sessions, next_page_token = collect_paginated_resources(
+        "/sessions",
+        page_size=args.page_size,
+        resource_key="sessions",
+        page_token=args.page_token,
+    )
+    active_sessions = [
+        summarize_session_brief(session, include_merge_status=args.include_merge_status)
+        for session in sessions
+        if session.get("state") in OPEN_STATES and session_matches_repo_filter(session, args.repo_filter)
+    ]
+    print_json({"sessions": active_sessions, "nextPageToken": next_page_token})
+
+
+def stale_session_report(args: argparse.Namespace) -> None:
+    sessions, next_page_token = collect_paginated_resources(
+        "/sessions",
+        page_size=args.page_size,
+        resource_key="sessions",
+        page_token=args.page_token,
+    )
+    cutoff_hours = args.stale_after_hours
+    now = utc_now()
+    results = []
+
+    for session in sessions:
+        if not session_matches_repo_filter(session, args.repo_filter):
+            continue
+        state = session.get("state")
+        if state not in OPEN_STATES:
+            continue
+
+        updated_at = parse_rfc3339(session.get("updateTime")) or parse_rfc3339(session.get("createTime"))
+        if updated_at is None:
+            continue
+
+        stale_hours = (now - updated_at.astimezone(dt.timezone.utc)).total_seconds() / 3600
+        if stale_hours < cutoff_hours:
+            continue
+
+        entry = {
+            **summarize_session_brief(session),
+            "staleHours": round(stale_hours, 2),
+            "staleAfterHours": cutoff_hours,
+        }
+        if args.include_merge_status:
+            entry["mergeStatus"] = build_merge_report(session)
+        results.append(entry)
+
+    print_json(
+        {
+            "summary": {
+                "staleAfterHours": cutoff_hours,
+                "staleSessionCount": len(results),
+            },
+            "sessions": results,
+            "nextPageToken": next_page_token,
+        }
+    )
+
+
+def list_unmerged_sessions(args: argparse.Namespace) -> None:
+    sessions, next_page_token = collect_paginated_resources(
+        "/sessions",
+        page_size=args.page_size,
+        resource_key="sessions",
+        page_token=args.page_token,
+    )
+    results = []
+
+    for session in sessions:
+        if not session_matches_repo_filter(session, args.repo_filter):
+            continue
+        report = build_merge_report(session)
+        if not report["hasPullRequest"] and not args.include_without_pr:
+            continue
+
+        unresolved = [item for item in report["pullRequests"] if item.get("status") != "merged"]
+        if not unresolved and report["hasPullRequest"]:
+            continue
+
+        if not report["hasPullRequest"] and args.include_without_pr:
+            unresolved = [{"status": "no_pr", "reason": "No pull request URL found in session outputs."}]
+
+        results.append(
+            {
+                **summarize_session_brief(session),
+                "mergeStatus": {
+                    "hasPullRequest": report["hasPullRequest"],
+                    "unmergedPullRequests": unresolved,
+                    "allMerged": report["allMerged"],
+                },
+            }
+        )
+
+    print_json({"sessions": results, "nextPageToken": next_page_token})
+
+
+def list_merged_sessions(args: argparse.Namespace) -> None:
+    sessions, next_page_token = collect_paginated_resources(
+        "/sessions",
+        page_size=args.page_size,
+        resource_key="sessions",
+        page_token=args.page_token,
+    )
+    results = []
+
+    for session in sessions:
+        if not session_matches_repo_filter(session, args.repo_filter):
+            continue
+        report = build_merge_report(session)
+        if not report["mergedPullRequests"]:
+            continue
+        if args.require_all_merged and not report["allMerged"]:
+            continue
+
+        results.append(
+            {
+                **summarize_session_brief(session),
+                "mergeStatus": {
+                    "hasPullRequest": report["hasPullRequest"],
+                    "mergedPullRequests": report["mergedPullRequests"],
+                    "allMerged": report["allMerged"],
+                },
+            }
+        )
+
+    print_json({"sessions": results, "nextPageToken": next_page_token})
+
+
+def cleanup_report(args: argparse.Namespace) -> None:
+    sessions, next_page_token = collect_paginated_resources(
+        "/sessions",
+        page_size=args.page_size,
+        resource_key="sessions",
+        page_token=args.page_token,
+    )
+    merged_candidates = []
+    unmerged_sessions = []
+    without_pr_sessions = []
+    scanned_sessions = 0
+
+    for session in sessions:
+        if not session_matches_repo_filter(session, args.repo_filter):
+            continue
+        scanned_sessions += 1
+        brief = summarize_session_brief(session)
+        report = build_merge_report(session)
+
+        if not report["hasPullRequest"]:
+            without_pr_sessions.append(
+                {
+                    **brief,
+                    "mergeStatus": {
+                        "hasPullRequest": False,
+                        "reason": "No pull request URL found in session outputs.",
+                    },
+                }
+            )
+            continue
+
+        if report["mergedPullRequests"]:
+            if not args.require_all_merged or report["allMerged"]:
+                merged_candidates.append(
+                    {
+                        **brief,
+                        "mergeStatus": {
+                            "hasPullRequest": True,
+                            "mergedPullRequests": report["mergedPullRequests"],
+                            "allMerged": report["allMerged"],
+                        },
+                    }
+                )
+
+        unresolved = [item for item in report["pullRequests"] if item.get("status") != "merged"]
+        if unresolved:
+            unmerged_sessions.append(
+                {
+                    **brief,
+                    "mergeStatus": {
+                        "hasPullRequest": True,
+                        "unmergedPullRequests": unresolved,
+                        "allMerged": report["allMerged"],
+                    },
+                }
+            )
+
+    payload = {
+        "summary": {
+            "totalSessionsScanned": scanned_sessions,
+            "mergedCandidateCount": len(merged_candidates),
+            "unmergedCount": len(unmerged_sessions),
+            "withoutPrCount": len(without_pr_sessions),
+        },
+        "mergedCandidates": merged_candidates,
+        "unmergedSessions": unmerged_sessions,
+        "withoutPullRequest": without_pr_sessions,
+        "nextPageToken": next_page_token,
+    }
+    emit_output(
+        payload,
+        compact=args.compact,
+        markdown=args.markdown,
+        compact_formatter=format_cleanup_report_compact,
+        markdown_formatter=format_cleanup_report_markdown,
+    )
+
+
+def close_ready_report(args: argparse.Namespace) -> None:
+    sessions, next_page_token = collect_paginated_resources(
+        "/sessions",
+        page_size=args.page_size,
+        resource_key="sessions",
+        page_token=args.page_token,
+    )
+    candidates = []
+
+    for session in sessions:
+        if not session_matches_repo_filter(session, args.repo_filter):
+            continue
+        report = build_merge_report(session)
+        if not report["mergedPullRequests"]:
+            continue
+        if args.require_all_merged and not report["allMerged"]:
+            continue
+
+        brief = summarize_session_brief(session)
+        candidate = {
+            **brief,
+            "mergeStatus": report,
+            "message": build_close_message(normalize_session_name(session.get("name", "")), brief, report),
+            "recommendedCommand": (
+                f"python3 scripts/jules_api.py close-merged-session --session {normalize_session_name(session.get('name', ''))} "
+                f"--confirm-close {CLOSE_CONFIRM_TOKEN}"
+            ),
+        }
+        candidates.append(candidate)
+
+    payload = {
+        "summary": {
+            "candidateCount": len(candidates),
+        },
+        "candidates": candidates,
+        "nextPageToken": next_page_token,
+    }
+    emit_output(
+        payload,
+        compact=args.compact,
+        markdown=args.markdown,
+        compact_formatter=format_close_ready_compact,
+        markdown_formatter=format_close_ready_markdown,
+    )
+
+
+def notify_close_plan(args: argparse.Namespace) -> None:
+    session_name = normalize_session_name(args.session)
+    session = api_request("GET", f"/{session_name}")
+    report = build_merge_report(session)
+    brief = summarize_session_brief(session)
+
+    merged_prs = report["mergedPullRequests"]
+    if not merged_prs:
+        fail("No merged pull request was found for this session, so a close notification plan cannot be generated safely.")
+
+    payload = {
+        "session": brief,
+        "mergeStatus": report,
+        "message": build_close_message(session_name, brief, report),
+        "recommendedCommand": f"python3 scripts/jules_api.py close-merged-session --session {session_name} --confirm-close {CLOSE_CONFIRM_TOKEN}",
+    }
+    if args.markdown:
+        print_text(payload["message"])
+        return
+    print_json(payload)
+
+
+def list_sources(args: argparse.Namespace) -> None:
+    sources, next_page_token = collect_paginated_resources(
+        "/sources",
+        page_size=args.page_size,
+        resource_key="sources",
+        page_token=args.page_token,
+        extra_query={"filter": args.filter},
+    )
+    print_json({"sources": sources, "nextPageToken": next_page_token})
+
+
+def repo_to_source(args: argparse.Namespace) -> None:
+    repo = args.repo.strip()
+    if not repo or "/" not in repo:
+        fail("Use --repo owner/repo.")
+    sources, next_page_token = collect_paginated_resources(
+        "/sources",
+        page_size=args.page_size,
+        resource_key="sources",
+        page_token=args.page_token,
+    )
+    matches = [source for source in sources if source.get("name") == f"sources/github/{repo}"]
+
+    if not matches and args.allow_contains:
+        matches = [source for source in sources if repo in source.get("name", "")]
+
+    payload = {
+        "repo": repo,
+        "matches": matches,
+        "count": len(matches),
+        "nextPageToken": next_page_token,
+    }
+
+    if args.compact:
+        if matches:
+            print_text(matches[0].get("name", ""))
+            return
+        print_text("")
+        return
+    print_json(payload)
+
+
+def list_sessions(args: argparse.Namespace) -> None:
+    response = api_request("GET", "/sessions", query={"pageSize": args.page_size, "pageToken": args.page_token})
+    print_json(response)
+
+
+def delete_session(args: argparse.Namespace) -> None:
+    session_name = normalize_session_name(args.session)
+    api_request("DELETE", f"/{session_name}")
+    print(json.dumps({"ok": True, "deleted": session_name}, ensure_ascii=False))
+
+
+def get_session(args: argparse.Namespace) -> None:
+    response = api_request("GET", f"/{normalize_session_name(args.session)}")
+    print_json(response)
+
+
+def create_session(args: argparse.Namespace) -> None:
+    payload: dict[str, Any] = {
+        "prompt": args.prompt,
+        "sourceContext": {
+            "source": args.source,
+            "githubRepoContext": {
+                "startingBranch": args.branch,
+            },
+        },
+    }
+    if args.title:
+        payload["title"] = args.title
+    if args.require_plan_approval:
+        payload["requirePlanApproval"] = True
+    if args.automation_mode:
+        payload["automationMode"] = args.automation_mode
+    response = api_request("POST", "/sessions", payload=payload)
+    print_json(response)
+
+
+def send_message(args: argparse.Namespace) -> None:
+    api_request("POST", f"/{normalize_session_name(args.session)}:sendMessage", payload={"prompt": args.prompt})
+    print(json.dumps({"ok": True, "session": normalize_session_name(args.session)}, ensure_ascii=False))
+
+
+def approve_plan(args: argparse.Namespace) -> None:
+    api_request("POST", f"/{normalize_session_name(args.session)}:approvePlan", payload={})
+    print(json.dumps({"ok": True, "session": normalize_session_name(args.session)}, ensure_ascii=False))
+
+
+def list_activities(args: argparse.Namespace) -> None:
+    response = api_request(
+        "GET",
+        f"/{normalize_session_name(args.session)}/activities",
+        query={"pageSize": args.page_size, "pageToken": args.page_token},
+    )
+    print_json(response)
+
+
+def get_activity(args: argparse.Namespace) -> None:
+    session_name = normalize_session_name(args.session)
+    activity_name = args.activity.strip()
+    if not activity_name:
+        fail("Activity identifier is required.")
+    if activity_name.startswith("sessions/"):
+        resource_name = activity_name
+    else:
+        resource_name = f"{session_name}/activities/{activity_name}"
+    response = api_request("GET", f"/{resource_name}")
+    print_json(response)
+
+
+def wait_for_session(args: argparse.Namespace) -> None:
+    session_name = normalize_session_name(args.session)
+    deadline = time.time() + args.timeout
+
+    while True:
+        session = api_request("GET", f"/{session_name}")
+        state = session.get("state", "STATE_UNSPECIFIED")
+
+        if args.verbose:
+            print_json({"name": session.get("name"), "state": state, "updateTime": session.get("updateTime"), "url": session.get("url")})
+
+        if state in TERMINAL_STATES or state in WAITING_STATES:
+            print_json(session)
+            return
+
+        if time.time() >= deadline:
+            fail(f"Timed out while waiting for {session_name}. Last state: {state}")
+
+        time.sleep(args.interval)
+
+
+def find_pr_urls(value: Any) -> list[str]:
+    found: set[str] = set()
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            for child in node.values():
+                visit(child)
+            return
+        if isinstance(node, list):
+            for child in node:
+                visit(child)
+            return
+        if isinstance(node, str):
+            for match in PR_URL_RE.findall(node):
+                found.add(match.rstrip(".,)"))
+
+    visit(value)
+    return sorted(found)
+
+
+def gh_is_available() -> bool:
+    return shutil.which("gh") is not None
+
+
+def gh_auth_check(args: argparse.Namespace) -> None:
+    gh_status = collect_gh_auth_status()
+    payload: dict[str, Any] = {
+        "ghInstalled": gh_status["installed"],
+        "authenticated": gh_status["authenticated"],
+        "stdout": gh_status.get("stdout", ""),
+        "stderr": gh_status.get("stderr", ""),
+        "reason": gh_status.get("reason", ""),
+    }
+
+    if args.compact:
+        state = "ok" if payload["authenticated"] else "not_authenticated"
+        print_text(f"gh_installed={str(payload['ghInstalled']).lower()} gh_auth={state}")
+        return
+    print_json(payload)
+
+
+def fetch_pr_status(pr_url: str) -> dict[str, Any]:
+    if not gh_is_available():
+        return {"url": pr_url, "status": "unknown", "reason": "gh CLI is not installed."}
+
+    command = ["gh", "pr", "view", pr_url, "--json", "number,state,mergedAt,title,url"]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=True)
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "").strip()
+        return {"url": pr_url, "status": "unknown", "reason": stderr or "Failed to query GitHub PR status via gh."}
+
+    payload = json.loads(result.stdout)
+    merged = bool(payload.get("mergedAt"))
+    return {
+        "url": payload.get("url", pr_url),
+        "number": payload.get("number"),
+        "title": payload.get("title"),
+        "state": payload.get("state"),
+        "mergedAt": payload.get("mergedAt"),
+        "merged": merged,
+        "status": "merged" if merged else "not_merged",
+    }
+
+
+def build_merge_report(session: dict[str, Any]) -> dict[str, Any]:
+    outputs = session.get("outputs", [])
+    pr_urls = find_pr_urls(outputs)
+    prs = [fetch_pr_status(url) for url in pr_urls]
+    merged_prs = [item for item in prs if item.get("merged")]
+
+    return {
+        "hasPullRequest": bool(prs),
+        "pullRequests": prs,
+        "mergedPullRequests": merged_prs,
+        "allMerged": bool(prs) and len(merged_prs) == len(prs),
+    }
+
+
+def build_close_message(session_name: str, brief: dict[str, Any], report: dict[str, Any]) -> str:
+    lines = [
+        f"Jules session `{session_name}` is a close candidate.",
+        f"Title: {brief.get('title') or '(untitled)'}",
+        f"State: {brief.get('state')}",
+    ]
+
+    for pr in report.get("mergedPullRequests", []):
+        pr_title = pr.get("title") or "(untitled PR)"
+        pr_url = pr.get("url") or "(missing URL)"
+        merged_at = pr.get("mergedAt") or "unknown time"
+        lines.append(f"Merged PR: #{pr.get('number')} {pr_title} ({pr_url}) at {merged_at}")
+
+    if report.get("allMerged"):
+        lines.append("All discovered PRs for this session are merged.")
+    else:
+        lines.append("Some PRs are merged, but not all discovered PRs are merged yet.")
+
+    lines.append(
+        f"If you want to close it, confirm and then run: python3 scripts/jules_api.py close-merged-session --session {session_name} --confirm-close {CLOSE_CONFIRM_TOKEN}"
+    )
+    return "\n".join(lines)
+
+
+def summarize_session_brief(session: dict[str, Any], *, include_merge_status: bool = False) -> dict[str, Any]:
+    summary = {
+        "name": session.get("name"),
+        "id": session.get("id"),
+        "title": session.get("title"),
+        "state": session.get("state"),
+        "url": session.get("url"),
+        "repo": extract_repo_name(session),
+        "updateTime": session.get("updateTime"),
+        "outputCount": len(session.get("outputs", [])),
+        "pullRequestUrls": find_pr_urls(session.get("outputs", [])),
+    }
+    if include_merge_status:
+        summary["mergeStatus"] = build_merge_report(session)
+    return summary
+
+
+def summarize_activity(activity: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "name": activity.get("name"),
+        "createTime": activity.get("createTime"),
+        "originator": activity.get("originator"),
+        "description": activity.get("description"),
+    }
+
+    if "agentMessaged" in activity:
+        summary["type"] = "agentMessaged"
+        summary["message"] = activity["agentMessaged"].get("agentMessage")
+    elif "userMessaged" in activity:
+        summary["type"] = "userMessaged"
+        summary["message"] = activity["userMessaged"].get("userMessage")
+    elif "planGenerated" in activity:
+        summary["type"] = "planGenerated"
+        plan = activity["planGenerated"].get("plan", {})
+        summary["planId"] = plan.get("id")
+        summary["steps"] = [step.get("title") for step in plan.get("steps", [])]
+    elif "progressUpdated" in activity:
+        summary["type"] = "progressUpdated"
+        summary["title"] = activity["progressUpdated"].get("title")
+        summary["details"] = activity["progressUpdated"].get("description")
+    elif "planApproved" in activity:
+        summary["type"] = "planApproved"
+        summary["planId"] = activity["planApproved"].get("planId")
+    elif "sessionCompleted" in activity:
+        summary["type"] = "sessionCompleted"
+    elif "sessionFailed" in activity:
+        summary["type"] = "sessionFailed"
+        summary["reason"] = activity["sessionFailed"].get("reason")
+    else:
+        summary["type"] = "unknown"
+
+    artifacts = []
+    for artifact in activity.get("artifacts", []):
+        if "bashOutput" in artifact:
+            bash_output = artifact["bashOutput"]
+            artifacts.append(
+                {
+                    "kind": "bashOutput",
+                    "command": bash_output.get("command"),
+                    "exitCode": bash_output.get("exitCode"),
+                    "output": bash_output.get("output"),
+                }
+            )
+        elif "changeSet" in artifact:
+            change_set = artifact["changeSet"]
+            artifacts.append({"kind": "changeSet", "title": change_set.get("title"), "description": change_set.get("description")})
+        elif "media" in artifact:
+            media = artifact["media"]
+            artifacts.append({"kind": "media", "mimeType": media.get("mimeType")})
+
+    if artifacts:
+        summary["artifacts"] = artifacts
+
+    return summary
+
+
+def summarize_session(args: argparse.Namespace) -> None:
+    session_name = normalize_session_name(args.session)
+    session = api_request("GET", f"/{session_name}")
+    activity_response = api_request("GET", f"/{session_name}/activities", query={"pageSize": args.page_size})
+    activities = activity_response.get("activities", [])
+    latest = activities[-1] if activities else None
+
+    summary = {
+        "session": {
+            "name": session.get("name"),
+            "id": session.get("id"),
+            "title": session.get("title"),
+            "state": session.get("state"),
+            "url": session.get("url"),
+            "repo": extract_repo_name(session),
+            "createTime": session.get("createTime"),
+            "updateTime": session.get("updateTime"),
+            "outputs": session.get("outputs", []),
+        },
+        "activityCount": len(activities),
+        "latestActivity": summarize_activity(latest) if latest else None,
+        "recentActivities": [summarize_activity(item) for item in activities[-args.recent_count :]],
+    }
+    if args.include_merge_status:
+        summary["mergeStatus"] = build_merge_report(session)
+    print_json(summary)
+
+
+def resume_session(args: argparse.Namespace) -> None:
+    session_name = normalize_session_name(args.session)
+    session = api_request("GET", f"/{session_name}")
+    state = session.get("state", "STATE_UNSPECIFIED")
+
+    actions = []
+    if state == "AWAITING_PLAN_APPROVAL":
+        api_request("POST", f"/{session_name}:approvePlan", payload={})
+        actions.append("approved_plan")
+        if args.prompt:
+            api_request("POST", f"/{session_name}:sendMessage", payload={"prompt": args.prompt})
+            actions.append("sent_message")
+    elif state in {"AWAITING_USER_FEEDBACK", "PAUSED"}:
+        if not args.prompt:
+            fail(f"Session is {state}. Provide --prompt so Jules has instructions to continue.")
+        api_request("POST", f"/{session_name}:sendMessage", payload={"prompt": args.prompt})
+        actions.append("sent_message")
+    elif state in ACTIVE_STATES:
+        if not args.allow_active:
+            fail(f"Session is already active ({state}). Use --allow-active to send an extra message anyway.")
+        if not args.prompt:
+            fail("Use --prompt together with --allow-active to send more instructions to an active session.")
+        api_request("POST", f"/{session_name}:sendMessage", payload={"prompt": args.prompt})
+        actions.append("sent_message")
+    elif state in TERMINAL_STATES:
+        fail(f"Session is {state} and cannot be resumed.")
+    else:
+        fail(f"Unsupported session state for resume helper: {state}")
+
+    print_json({"ok": True, "session": session_name, "state": state, "actions": actions})
+
+
+def export_session(args: argparse.Namespace) -> None:
+    session_name = normalize_session_name(args.session)
+    payload: Any
+
+    if args.kind == "session":
+        payload = api_request("GET", f"/{session_name}")
+    elif args.kind == "activities":
+        payload = api_request("GET", f"/{session_name}/activities", query={"pageSize": args.page_size})
+    elif args.kind == "outputs":
+        session = api_request("GET", f"/{session_name}")
+        payload = {"session": session_name, "outputs": session.get("outputs", [])}
+    else:
+        session = api_request("GET", f"/{session_name}")
+        activity_response = api_request("GET", f"/{session_name}/activities", query={"pageSize": args.page_size})
+        activities = activity_response.get("activities", [])
+        latest = activities[-1] if activities else None
+        payload = {
+            "session": session,
+            "activityCount": len(activities),
+            "latestActivity": summarize_activity(latest) if latest else None,
+            "recentActivities": [summarize_activity(item) for item in activities[-args.recent_count :]],
+        }
+        if args.include_merge_status:
+            payload["mergeStatus"] = build_merge_report(session)
+
+    rendered = json.dumps(payload, indent=2, ensure_ascii=False)
+    if args.output:
+        with open(args.output, "w", encoding="utf-8") as handle:
+            handle.write(rendered)
+            handle.write("\n")
+        print(json.dumps({"ok": True, "path": args.output, "kind": args.kind, "session": session_name}, ensure_ascii=False))
+        return
+    print(rendered)
+
+
+def check_merge_status(args: argparse.Namespace) -> None:
+    session_name = normalize_session_name(args.session)
+    session = api_request("GET", f"/{session_name}")
+    report = build_merge_report(session)
+    print_json({"session": summarize_session_brief(session), "mergeStatus": report})
+
+
+def close_merged_session(args: argparse.Namespace) -> None:
+    session_name = normalize_session_name(args.session)
+    session = api_request("GET", f"/{session_name}")
+    report = build_merge_report(session)
+
+    if not report["hasPullRequest"]:
+        fail("This session has no pull request URL in its outputs, so merged-close cannot verify it safely.")
+    if not report["mergedPullRequests"]:
+        fail("No merged pull request was found for this session. Refusing to close it.")
+    if args.require_all_merged and not report["allMerged"]:
+        fail("Some pull requests for this session are not merged yet. Refusing to close it.")
+    if args.confirm_close != CLOSE_CONFIRM_TOKEN:
+        fail(
+            "Merged pull request detected, but close confirmation is missing. "
+            f"Re-run with --confirm-close {CLOSE_CONFIRM_TOKEN} after user approval."
+        )
+
+    api_request("DELETE", f"/{session_name}")
+    print_json(
+        {
+            "ok": True,
+            "deleted": session_name,
+            "session": summarize_session_brief(session),
+            "mergeStatus": report,
+        }
+    )
+
+
+def doctor(args: argparse.Namespace) -> None:
+    dotenv_path = find_dotenv_path()
+    api_key_present = bool(os.environ.get("JULES_API_KEY", "").strip())
+    gh_status = collect_gh_auth_status()
+    jules_status = collect_jules_cli_status()
+
+    payload = {
+        "dotenv": {
+            "found": bool(dotenv_path),
+            "path": str(dotenv_path) if dotenv_path else None,
+        },
+        "julesApiKey": {
+            "present": api_key_present,
+        },
+        "gh": gh_status,
+        "julesCli": jules_status,
+    }
+
+    payload["ready"] = bool(api_key_present and gh_status.get("installed") and gh_status.get("authenticated"))
+
+    if args.compact:
+        print_text(
+            " ".join(
+                [
+                    f"dotenv={'yes' if payload['dotenv']['found'] else 'no'}",
+                    f"api_key={'yes' if api_key_present else 'no'}",
+                    f"gh={'yes' if gh_status.get('installed') else 'no'}",
+                    f"gh_auth={'yes' if gh_status.get('authenticated') else 'no'}",
+                    f"jules_cli={'yes' if jules_status.get('installed') else 'no'}",
+                    f"ready={'yes' if payload['ready'] else 'no'}",
+                ]
+            )
+        )
+        return
+    print_json(payload)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Control Google Jules via the Jules REST API.")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    list_active_sessions_parser = subparsers.add_parser("list-active-sessions", help="List non-terminal Jules sessions.")
+    list_active_sessions_parser.add_argument("--page-size", type=int, default=50)
+    list_active_sessions_parser.add_argument("--page-token")
+    list_active_sessions_parser.add_argument("--repo-filter", help="Only include sessions for owner/repo.")
+    list_active_sessions_parser.add_argument(
+        "--include-merge-status",
+        action="store_true",
+        help="Also inspect PR merge status with gh when PR URLs are present in outputs.",
+    )
+    list_active_sessions_parser.set_defaults(func=list_active_sessions)
+
+    stale_session_report_parser = subparsers.add_parser(
+        "stale-session-report",
+        help="List open Jules sessions that have not been updated recently.",
+    )
+    stale_session_report_parser.add_argument("--page-size", type=int, default=50)
+    stale_session_report_parser.add_argument("--page-token")
+    stale_session_report_parser.add_argument("--repo-filter", help="Only include sessions for owner/repo.")
+    stale_session_report_parser.add_argument(
+        "--stale-after-hours",
+        type=float,
+        default=24.0,
+        help="Treat open sessions as stale after this many hours without updates.",
+    )
+    stale_session_report_parser.add_argument(
+        "--include-merge-status",
+        action="store_true",
+        help="Also inspect PR merge status with gh when PR URLs are present in outputs.",
+    )
+    stale_session_report_parser.set_defaults(func=stale_session_report)
+
+    list_unmerged_sessions_parser = subparsers.add_parser(
+        "list-unmerged-sessions",
+        help="List sessions whose discovered PR outputs are not merged yet.",
+    )
+    list_unmerged_sessions_parser.add_argument("--page-size", type=int, default=50)
+    list_unmerged_sessions_parser.add_argument("--page-token")
+    list_unmerged_sessions_parser.add_argument("--repo-filter", help="Only include sessions for owner/repo.")
+    list_unmerged_sessions_parser.add_argument(
+        "--include-without-pr",
+        action="store_true",
+        help="Also include sessions that have no pull request URL in their outputs.",
+    )
+    list_unmerged_sessions_parser.set_defaults(func=list_unmerged_sessions)
+
+    list_merged_sessions_parser = subparsers.add_parser(
+        "list-merged-sessions",
+        help="List sessions whose discovered PR outputs include merged pull requests.",
+    )
+    list_merged_sessions_parser.add_argument("--page-size", type=int, default=50)
+    list_merged_sessions_parser.add_argument("--page-token")
+    list_merged_sessions_parser.add_argument("--repo-filter", help="Only include sessions for owner/repo.")
+    list_merged_sessions_parser.add_argument(
+        "--require-all-merged",
+        action="store_true",
+        help="Only include sessions where every discovered PR URL is merged.",
+    )
+    list_merged_sessions_parser.set_defaults(func=list_merged_sessions)
+
+    cleanup_report_parser = subparsers.add_parser(
+        "cleanup-report",
+        help="Show merged cleanup candidates, unmerged work, and sessions without PR outputs in one report.",
+    )
+    cleanup_report_parser.add_argument("--page-size", type=int, default=50)
+    cleanup_report_parser.add_argument("--page-token")
+    cleanup_report_parser.add_argument("--repo-filter", help="Only include sessions for owner/repo.")
+    cleanup_report_parser.add_argument(
+        "--require-all-merged",
+        action="store_true",
+        help="Only treat sessions as merged candidates when every discovered PR URL is merged.",
+    )
+    cleanup_report_parser.add_argument("--compact", action="store_true", help="Print a one-line summary instead of JSON.")
+    cleanup_report_parser.add_argument("--markdown", action="store_true", help="Print a Markdown report instead of JSON.")
+    cleanup_report_parser.set_defaults(func=cleanup_report)
+
+    close_ready_report_parser = subparsers.add_parser(
+        "close-ready-report",
+        help="Show merged-session cleanup candidates with close instructions.",
+    )
+    close_ready_report_parser.add_argument("--page-size", type=int, default=50)
+    close_ready_report_parser.add_argument("--page-token")
+    close_ready_report_parser.add_argument("--repo-filter", help="Only include sessions for owner/repo.")
+    close_ready_report_parser.add_argument(
+        "--require-all-merged",
+        action="store_true",
+        help="Only include sessions where every discovered PR URL is merged.",
+    )
+    close_ready_report_parser.add_argument("--compact", action="store_true", help="Print a one-line summary instead of JSON.")
+    close_ready_report_parser.add_argument("--markdown", action="store_true", help="Print a Markdown report instead of JSON.")
+    close_ready_report_parser.set_defaults(func=close_ready_report)
+
+    doctor_parser = subparsers.add_parser(
+        "doctor",
+        help="Check .env, API key, gh auth, and Jules CLI readiness in one command.",
+    )
+    doctor_parser.add_argument("--compact", action="store_true", help="Print a short status line instead of JSON.")
+    doctor_parser.set_defaults(func=doctor)
+
+    gh_auth_check_parser = subparsers.add_parser(
+        "gh-auth-check",
+        help="Verify that gh is installed and authenticated for PR merge checks.",
+    )
+    gh_auth_check_parser.add_argument("--compact", action="store_true", help="Print a short status line instead of JSON.")
+    gh_auth_check_parser.set_defaults(func=gh_auth_check)
+
+    list_sources_parser = subparsers.add_parser("list-sources", help="List connected Jules sources.")
+    list_sources_parser.add_argument("--filter", help="Optional AIP-160 name filter.")
+    list_sources_parser.add_argument("--page-size", type=int, default=30)
+    list_sources_parser.add_argument("--page-token")
+    list_sources_parser.set_defaults(func=list_sources)
+
+    repo_to_source_parser = subparsers.add_parser(
+        "repo-to-source",
+        help="Resolve owner/repo to a Jules source resource name.",
+    )
+    repo_to_source_parser.add_argument("--repo", required=True, help="GitHub repository in owner/repo format.")
+    repo_to_source_parser.add_argument("--page-size", type=int, default=100)
+    repo_to_source_parser.add_argument("--page-token")
+    repo_to_source_parser.add_argument("--allow-contains", action="store_true", help="Fallback to substring matching when exact source lookup fails.")
+    repo_to_source_parser.add_argument("--compact", action="store_true", help="Print only the first matched source name.")
+    repo_to_source_parser.set_defaults(func=repo_to_source)
+
+    list_sessions_parser = subparsers.add_parser("list-sessions", help="List Jules sessions.")
+    list_sessions_parser.add_argument("--page-size", type=int, default=30)
+    list_sessions_parser.add_argument("--page-token")
+    list_sessions_parser.set_defaults(func=list_sessions)
+
+    delete_session_parser = subparsers.add_parser("delete-session", help="Delete a Jules session.")
+    delete_session_parser.add_argument("--session", required=True, help="Session id or sessions/<id> resource name.")
+    delete_session_parser.set_defaults(func=delete_session)
+
+    cancel_session_parser = subparsers.add_parser(
+        "cancel-session",
+        help="Delete a Jules session as a cancel-style action. This is permanent.",
+    )
+    cancel_session_parser.add_argument("--session", required=True, help="Session id or sessions/<id> resource name.")
+    cancel_session_parser.set_defaults(func=delete_session)
+
+    get_session_parser = subparsers.add_parser("get-session", help="Fetch one Jules session.")
+    get_session_parser.add_argument("--session", required=True, help="Session id or sessions/<id> resource name.")
+    get_session_parser.set_defaults(func=get_session)
+
+    create_session_parser = subparsers.add_parser("create-session", help="Create a Jules session.")
+    create_session_parser.add_argument("--source", required=True, help="Source resource name, for example sources/github/OWNER/REPO.")
+    create_session_parser.add_argument("--branch", required=True, help="Git branch to start from.")
+    create_session_parser.add_argument("--prompt", required=True, help="Initial Jules task prompt.")
+    create_session_parser.add_argument("--title", help="Optional session title.")
+    create_session_parser.add_argument("--require-plan-approval", action="store_true", help="Require explicit plan approval before execution.")
+    create_session_parser.add_argument(
+        "--automation-mode",
+        choices=["AUTO_CREATE_PR"],
+        help="Optional Jules automation mode.",
+    )
+    create_session_parser.set_defaults(func=create_session)
+
+    send_message_parser = subparsers.add_parser("send-message", help="Send a follow-up message to a session.")
+    send_message_parser.add_argument("--session", required=True, help="Session id or sessions/<id> resource name.")
+    send_message_parser.add_argument("--prompt", required=True, help="Follow-up instruction.")
+    send_message_parser.set_defaults(func=send_message)
+
+    approve_plan_parser = subparsers.add_parser("approve-plan", help="Approve the latest plan in a session.")
+    approve_plan_parser.add_argument("--session", required=True, help="Session id or sessions/<id> resource name.")
+    approve_plan_parser.set_defaults(func=approve_plan)
+
+    list_activities_parser = subparsers.add_parser("list-activities", help="List activities for a session.")
+    list_activities_parser.add_argument("--session", required=True, help="Session id or sessions/<id> resource name.")
+    list_activities_parser.add_argument("--page-size", type=int, default=50)
+    list_activities_parser.add_argument("--page-token")
+    list_activities_parser.set_defaults(func=list_activities)
+
+    get_activity_parser = subparsers.add_parser("get-activity", help="Fetch one activity from a session.")
+    get_activity_parser.add_argument("--session", required=True, help="Session id or sessions/<id> resource name.")
+    get_activity_parser.add_argument("--activity", required=True, help="Activity id or full activity resource name.")
+    get_activity_parser.set_defaults(func=get_activity)
+
+    wait_parser = subparsers.add_parser("wait", help="Poll a session until it needs action or finishes.")
+    wait_parser.add_argument("--session", required=True, help="Session id or sessions/<id> resource name.")
+    wait_parser.add_argument("--interval", type=int, default=10, help="Polling interval in seconds.")
+    wait_parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT_SECONDS, help="Maximum wait time in seconds.")
+    wait_parser.add_argument("--verbose", action="store_true", help="Print each polled state before the final session object.")
+    wait_parser.set_defaults(func=wait_for_session)
+
+    resume_parser = subparsers.add_parser(
+        "resume",
+        help="Best-effort resume helper: approve a pending plan or send a follow-up prompt depending on session state.",
+    )
+    resume_parser.add_argument("--session", required=True, help="Session id or sessions/<id> resource name.")
+    resume_parser.add_argument("--prompt", help="Optional follow-up instruction. Required for PAUSED and AWAITING_USER_FEEDBACK.")
+    resume_parser.add_argument("--allow-active", action="store_true", help="Allow sending a message even if the session is already active.")
+    resume_parser.set_defaults(func=resume_session)
+
+    summary_parser = subparsers.add_parser("summary", help="Print a compact summary for a session and its latest activities.")
+    summary_parser.add_argument("--session", required=True, help="Session id or sessions/<id> resource name.")
+    summary_parser.add_argument("--page-size", type=int, default=20, help="How many activities to fetch.")
+    summary_parser.add_argument("--recent-count", type=int, default=5, help="How many recent activities to include in the summary.")
+    summary_parser.add_argument(
+        "--include-merge-status",
+        action="store_true",
+        help="Also inspect PR merge status with gh when PR URLs are present in outputs.",
+    )
+    summary_parser.set_defaults(func=summarize_session)
+
+    export_parser = subparsers.add_parser("export", help="Export session data as JSON to stdout or a file.")
+    export_parser.add_argument("--session", required=True, help="Session id or sessions/<id> resource name.")
+    export_parser.add_argument(
+        "--kind",
+        choices=["summary", "session", "activities", "outputs"],
+        default="summary",
+        help="Which JSON payload to export.",
+    )
+    export_parser.add_argument("--page-size", type=int, default=50, help="How many activities to fetch for summary or activities export.")
+    export_parser.add_argument("--recent-count", type=int, default=5, help="How many recent activities to keep in summary export.")
+    export_parser.add_argument(
+        "--include-merge-status",
+        action="store_true",
+        help="Include PR merge status in summary export by querying GitHub with gh.",
+    )
+    export_parser.add_argument("--output", help="Write JSON to a file instead of stdout.")
+    export_parser.set_defaults(func=export_session)
+
+    check_merge_parser = subparsers.add_parser("check-merge-status", help="Inspect PR merge status for a Jules session via gh.")
+    check_merge_parser.add_argument("--session", required=True, help="Session id or sessions/<id> resource name.")
+    check_merge_parser.set_defaults(func=check_merge_status)
+
+    notify_close_parser = subparsers.add_parser(
+        "notify-close-plan",
+        help="Generate a user-facing confirmation message for a merged session before closing it.",
+    )
+    notify_close_parser.add_argument("--session", required=True, help="Session id or sessions/<id> resource name.")
+    notify_close_parser.add_argument("--markdown", action="store_true", help="Print only the user-facing message as Markdown text.")
+    notify_close_parser.set_defaults(func=notify_close_plan)
+
+    close_merged_parser = subparsers.add_parser(
+        "close-merged-session",
+        help="Delete a session only if a merged PR is detected and explicit confirmation is provided.",
+    )
+    close_merged_parser.add_argument("--session", required=True, help="Session id or sessions/<id> resource name.")
+    close_merged_parser.add_argument(
+        "--confirm-close",
+        help=f"Required safety token. Must be exactly {CLOSE_CONFIRM_TOKEN}.",
+    )
+    close_merged_parser.add_argument(
+        "--require-all-merged",
+        action="store_true",
+        help="Refuse to close unless every discovered PR URL for the session is merged.",
+    )
+    close_merged_parser.set_defaults(func=close_merged_session)
+
+    return parser
+
+
+def main() -> None:
+    load_dotenv()
+    parser = build_parser()
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
