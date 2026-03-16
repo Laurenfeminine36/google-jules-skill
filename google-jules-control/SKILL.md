@@ -78,6 +78,10 @@ python3 scripts/jules_api.py notify-close-plan --session sessions/1234567890 --m
 
 python3 scripts/jules_api.py check-merge-status --session sessions/1234567890
 
+python3 scripts/jules_api.py check-pr-readiness --session sessions/1234567890
+
+python3 scripts/jules_api.py request-pr-rework --session sessions/1234567890 --markdown
+
 python3 scripts/jules_api.py summary --session sessions/1234567890
 ```
 
@@ -286,6 +290,8 @@ python3 scripts/jules_api.py list-merged-sessions --repo-filter owner/repo --req
 
 Use this as the first step before asking the user which merged session should be closed.
 
+`close-ready-report` may also include `cautionCandidates` when some PRs are merged but the session is not fully safe to close yet, for example because not all PRs are merged or GitHub status could not be resolved.
+
 ### Example: Generate one cleanup overview before taking action
 
 User intent:
@@ -303,6 +309,7 @@ python3 scripts/jules_api.py cleanup-report --repo-filter owner/repo --require-a
 Use this as the default operational overview before cleanup. It groups sessions into:
 
 - `mergedCandidates`
+- `cautionCandidates`
 - `unmergedSessions`
 - `withoutPullRequest`
 
@@ -341,6 +348,30 @@ python3 scripts/jules_api.py notify-close-plan --session sessions/SESSION_ID
 ```
 
 Use the returned `message` as the user-facing confirmation text. Only run `close-merged-session` after the user clearly approves it.
+
+### Example: Ask Jules to rework a PR that is not merge-ready
+
+User intent:
+
+```text
+Check whether the PR is merge-ready. If not, prepare a follow-up message for Jules.
+```
+
+Suggested flow:
+
+```bash
+python3 scripts/jules_api.py check-pr-readiness --session sessions/SESSION_ID
+python3 scripts/jules_api.py request-pr-rework --session sessions/SESSION_ID --markdown
+```
+
+If you already want to send the rework request back to Jules:
+
+```bash
+python3 scripts/jules_api.py request-pr-rework \
+  --session sessions/SESSION_ID \
+  --extra-instruction "Keep the fix minimal and preserve the existing branch." \
+  --send
+```
 
 ### Example: Check GitHub auth before merge-aware reports
 
@@ -397,6 +428,10 @@ python3 scripts/jules_api.py close-ready-report --repo-filter owner/repo --requi
 - Prefer a local `.env` file over shell profile edits for `JULES_API_KEY`. The script auto-loads `.env` from the current working directory or the skill root.
 - Use `doctor` before the first live run to verify `.env`, `JULES_API_KEY`, `gh`, and `jules` CLI readiness in one place.
 - Use `repo-to-source` when the user gives only `owner/repo` and you need the exact Jules source resource name.
+- Use `check-pr-readiness` before cleanup when you need to know whether a PR is actually merge-ready, not just merged or open.
+- Use `request-pr-rework` when GitHub reports blockers such as merge conflicts, failed checks, or requested changes and you want a follow-up message for Jules.
+- If Jules returns quota or rate-limit errors, report the failure clearly. Do not invent a remaining-usage number when the API does not provide one.
+- Treat `cautionCandidates` as review-required items. They are not safe close targets by default.
 
 ## Script Reference
 
@@ -424,6 +459,8 @@ The bundled script lives at `scripts/jules_api.py` and supports:
 - `summary`
 - `export`
 - `check-merge-status`
+- `check-pr-readiness`
+- `request-pr-rework`
 - `notify-close-plan`
 - `close-merged-session`
 

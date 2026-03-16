@@ -49,6 +49,7 @@ Practical note:
 
 - There is no dedicated REST `resume` endpoint in the current public API. If a session is waiting, resume it by approving a pending plan or sending a follow-up message.
 - There is no reversible REST `cancel` endpoint distinct from deletion. Deleting the session is the closest cancellation-style action.
+- The public API does not document a reliable remaining-usage or quota-balance endpoint for end users. Handle quota failures explicitly, but do not guess a remaining amount.
 
 Activity types to watch:
 
@@ -103,21 +104,26 @@ The bundled `jules_api.py` script automates this with:
 - `list-merged-sessions --repo-filter owner/repo --require-all-merged`
 - `list-unmerged-sessions --repo-filter owner/repo`
 - `check-merge-status --session ...`
+- `check-pr-readiness --session ...`
+- `request-pr-rework --session ... --markdown`
 - `notify-close-plan --session ... --markdown`
 - `close-merged-session --session ... --confirm-close CLOSE_MERGED_SESSION`
 
 Implementation detail:
 
 - Merge status is checked through `gh pr view <url> --json state,mergedAt,...`.
+- Merge readiness is checked through `gh pr view <url> --json mergeable,mergeStateStatus,reviewDecision,statusCheckRollup,...`.
 - If `gh` is missing or unauthenticated, merge status falls back to `unknown` and close should not proceed automatically.
 - `gh-auth-check` is the fast preflight check before any merge-aware report.
 - `doctor` is the broader preflight check before the first live session run.
+- `close-ready-report` distinguishes between `candidates` and `cautionCandidates`. Treat caution entries as manual-review items, not automatic close targets.
 
 ## Troubleshooting
 
 - `API key not valid`: regenerate the key, strip spaces, and verify `JULES_API_KEY` is exported in the current shell.
 - `.env` not picked up`: verify the file is named exactly `.env` and placed either in the current working directory or the skill root.
 - `Permission denied`: verify the Google account has Jules access and the GitHub repo is connected inside Jules.
+- `Usage or rate limit exceeded`: retry later, reduce automation frequency, or check the Jules account/project limits. The script will fail clearly instead of estimating remaining usage.
 - No matching source: install/connect the GitHub repository in Jules first, then re-run `list-sources`.
 - Session appears stuck: inspect the latest activities and state before retrying. `AWAITING_PLAN_APPROVAL` and `AWAITING_USER_FEEDBACK` are usually waiting states, not failures.
 - Need richer repo context: keep the repository `AGENTS.md` current so Jules can infer project-specific conventions.

@@ -100,14 +100,61 @@ def api_request(method: str, path: str, *, payload: dict[str, Any] | None = None
             raw = response.read().decode("utf-8").strip()
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace").strip()
-        details = body or exc.reason
-        fail(f"Jules API request failed: {exc.code} {details}")
+        fail(build_api_error_message(exc.code, body or str(exc.reason)))
     except urllib.error.URLError as exc:
         fail(f"Jules API request failed: {exc.reason}")
 
     if not raw:
         return {}
     return json.loads(raw)
+
+
+def build_api_error_message(status_code: int, raw_body: str) -> str:
+    parsed_message = raw_body
+    parsed_status = None
+    parsed_details = None
+
+    try:
+        payload = json.loads(raw_body)
+    except json.JSONDecodeError:
+        payload = None
+
+    if isinstance(payload, dict):
+        error = payload.get("error", {})
+        if isinstance(error, dict):
+            parsed_message = error.get("message") or parsed_message
+            parsed_status = error.get("status")
+            parsed_details = error.get("details")
+
+    normalized = f"{status_code} {parsed_status or ''} {parsed_message}".lower()
+
+    if status_code == 429 or "resource_exhausted" in normalized or "quota" in normalized or "rate limit" in normalized:
+        return (
+            "Jules API request failed due to usage or rate limits. "
+            "The current public Jules API does not expose a reliable remaining-usage value here, "
+            "so this command is failing safely instead of guessing. "
+            f"HTTP {status_code}: {parsed_message}"
+        )
+
+    if status_code == 403 and any(token in normalized for token in ["permission", "access", "forbidden", "denied"]):
+        return (
+            "Jules API request was denied. Check that the current Google account has Jules access, "
+            "that the repository is connected in Jules, and that the API key is valid for this account. "
+            f"HTTP {status_code}: {parsed_message}"
+        )
+
+    if status_code == 401:
+        return (
+            "Jules API request was unauthorized. Check the JULES_API_KEY value in .env or the current shell. "
+            f"HTTP {status_code}: {parsed_message}"
+        )
+
+    if status_code == 404:
+        return f"Jules API request failed because the requested resource was not found. HTTP {status_code}: {parsed_message}"
+
+    if parsed_details:
+        return f"Jules API request failed: HTTP {status_code}: {parsed_message} | details={parsed_details}"
+    return f"Jules API request failed: HTTP {status_code}: {parsed_message}"
 
 
 def collect_paginated_resources(
@@ -264,6 +311,7 @@ def format_close_ready_markdown(payload: dict[str, Any]) -> str:
         "# Jules Close-Ready Report",
         "",
         f"- Candidates: {payload['summary']['candidateCount']}",
+        f"- Caution: {payload['summary']['cautionCount']}",
         "",
     ]
     for item in payload.get("candidates", []):
@@ -272,6 +320,12 @@ def format_close_ready_markdown(payload: dict[str, Any]) -> str:
         lines.append(f"- Close command: `{item.get('recommendedCommand')}`")
         lines.append(f"- Notify message: {item.get('message')}")
         lines.append("")
+    if payload.get("cautionCandidates"):
+        lines.append("## Caution")
+        for item in payload.get("cautionCandidates", []):
+            lines.append(format_session_line(item))
+            lines.append(f"- Reason: allMerged={item['closeReadiness'].get('allMerged')} unknownPRs={item['closeReadiness'].get('unknownPullRequestCount')}")
+            lines.append("")
     if not payload.get("candidates"):
         lines.append("- none")
     return "\n".join(lines)
@@ -279,7 +333,7 @@ def format_close_ready_markdown(payload: dict[str, Any]) -> str:
 
 def format_close_ready_compact(payload: dict[str, Any]) -> str:
     summary = payload["summary"]
-    return f"candidates={summary['candidateCount']}"
+    return f"candidates={summary['candidateCount']} caution={summary['cautionCount']}"
 
 
 def emit_output(payload: dict[str, Any], *, compact: bool = False, markdown: bool = False, compact_formatter=None, markdown_formatter=None) -> None:
@@ -433,6 +487,7 @@ def cleanup_report(args: argparse.Namespace) -> None:
     merged_candidates = []
     unmerged_sessions = []
     without_pr_sessions = []
+    caution_sessions = []
     scanned_sessions = 0
 
     for session in sessions:
@@ -441,11 +496,13 @@ def cleanup_report(args: argparse.Namespace) -> None:
         scanned_sessions += 1
         brief = summarize_session_brief(session)
         report = build_merge_report(session)
+        close_readiness = summarize_session_close_readiness(session, report)
 
         if not report["hasPullRequest"]:
             without_pr_sessions.append(
                 {
                     **brief,
+                    "closeReadiness": close_readiness,
                     "mergeStatus": {
                         "hasPullRequest": False,
                         "reason": "No pull request URL found in session outputs.",
@@ -455,10 +512,23 @@ def cleanup_report(args: argparse.Namespace) -> None:
             continue
 
         if report["mergedPullRequests"]:
-            if not args.require_all_merged or report["allMerged"]:
+            if close_readiness["closeReady"] and (not args.require_all_merged or report["allMerged"]):
                 merged_candidates.append(
                     {
                         **brief,
+                        "closeReadiness": close_readiness,
+                        "mergeStatus": {
+                            "hasPullRequest": True,
+                            "mergedPullRequests": report["mergedPullRequests"],
+                            "allMerged": report["allMerged"],
+                        },
+                    }
+                )
+            elif close_readiness["caution"]:
+                caution_sessions.append(
+                    {
+                        **brief,
+                        "closeReadiness": close_readiness,
                         "mergeStatus": {
                             "hasPullRequest": True,
                             "mergedPullRequests": report["mergedPullRequests"],
@@ -472,6 +542,7 @@ def cleanup_report(args: argparse.Namespace) -> None:
             unmerged_sessions.append(
                 {
                     **brief,
+                    "closeReadiness": close_readiness,
                     "mergeStatus": {
                         "hasPullRequest": True,
                         "unmergedPullRequests": unresolved,
@@ -484,10 +555,12 @@ def cleanup_report(args: argparse.Namespace) -> None:
         "summary": {
             "totalSessionsScanned": scanned_sessions,
             "mergedCandidateCount": len(merged_candidates),
+            "cautionCount": len(caution_sessions),
             "unmergedCount": len(unmerged_sessions),
             "withoutPrCount": len(without_pr_sessions),
         },
         "mergedCandidates": merged_candidates,
+        "cautionCandidates": caution_sessions,
         "unmergedSessions": unmerged_sessions,
         "withoutPullRequest": without_pr_sessions,
         "nextPageToken": next_page_token,
@@ -509,19 +582,20 @@ def close_ready_report(args: argparse.Namespace) -> None:
         page_token=args.page_token,
     )
     candidates = []
+    caution_candidates = []
 
     for session in sessions:
         if not session_matches_repo_filter(session, args.repo_filter):
             continue
         report = build_merge_report(session)
+        close_readiness = summarize_session_close_readiness(session, report)
         if not report["mergedPullRequests"]:
-            continue
-        if args.require_all_merged and not report["allMerged"]:
             continue
 
         brief = summarize_session_brief(session)
-        candidate = {
+        item = {
             **brief,
+            "closeReadiness": close_readiness,
             "mergeStatus": report,
             "message": build_close_message(normalize_session_name(session.get("name", "")), brief, report),
             "recommendedCommand": (
@@ -529,13 +603,19 @@ def close_ready_report(args: argparse.Namespace) -> None:
                 f"--confirm-close {CLOSE_CONFIRM_TOKEN}"
             ),
         }
-        candidates.append(candidate)
+
+        if close_readiness["closeReady"] and (not args.require_all_merged or report["allMerged"]):
+            candidates.append(item)
+        elif close_readiness["caution"]:
+            caution_candidates.append(item)
 
     payload = {
         "summary": {
             "candidateCount": len(candidates),
+            "cautionCount": len(caution_candidates),
         },
         "candidates": candidates,
+        "cautionCandidates": caution_candidates,
         "nextPageToken": next_page_token,
     }
     emit_output(
@@ -745,7 +825,14 @@ def fetch_pr_status(pr_url: str) -> dict[str, Any]:
     if not gh_is_available():
         return {"url": pr_url, "status": "unknown", "reason": "gh CLI is not installed."}
 
-    command = ["gh", "pr", "view", pr_url, "--json", "number,state,mergedAt,title,url"]
+    command = [
+        "gh",
+        "pr",
+        "view",
+        pr_url,
+        "--json",
+        "number,state,mergedAt,title,url,mergeable,mergeStateStatus,reviewDecision,statusCheckRollup",
+    ]
     try:
         result = subprocess.run(command, capture_output=True, text=True, check=True)
     except subprocess.CalledProcessError as exc:
@@ -762,6 +849,94 @@ def fetch_pr_status(pr_url: str) -> dict[str, Any]:
         "mergedAt": payload.get("mergedAt"),
         "merged": merged,
         "status": "merged" if merged else "not_merged",
+        "mergeable": payload.get("mergeable"),
+        "mergeStateStatus": payload.get("mergeStateStatus"),
+        "reviewDecision": payload.get("reviewDecision"),
+        "statusCheckRollup": payload.get("statusCheckRollup"),
+    }
+
+
+def is_pr_merge_ready(pr: dict[str, Any]) -> bool:
+    if pr.get("merged"):
+        return True
+    if pr.get("status") == "unknown":
+        return False
+    if pr.get("mergeable") not in ("MERGEABLE", True):
+        return False
+    if pr.get("reviewDecision") == "CHANGES_REQUESTED":
+        return False
+
+    merge_state = pr.get("mergeStateStatus")
+    if merge_state in {"DIRTY", "BEHIND", "BLOCKED", "DRAFT", "HAS_HOOKS", "UNKNOWN", "UNSTABLE"}:
+        return False
+
+    checks = pr.get("statusCheckRollup")
+    if isinstance(checks, list):
+        for check in checks:
+            conclusion = check.get("conclusion")
+            status = check.get("status")
+            if conclusion in {"FAILURE", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE", "ACTION_REQUIRED"}:
+                return False
+            if status and status not in {"COMPLETED", "SUCCESS"} and conclusion not in {"SUCCESS", None}:
+                return False
+    return True
+
+
+def summarize_pr_merge_readiness(pr: dict[str, Any]) -> dict[str, Any]:
+    ready = is_pr_merge_ready(pr)
+    blockers: list[str] = []
+
+    if pr.get("status") == "unknown":
+        blockers.append(pr.get("reason", "PR status is unknown."))
+    if pr.get("mergeable") not in ("MERGEABLE", True):
+        blockers.append(f"mergeable={pr.get('mergeable')}")
+    merge_state = pr.get("mergeStateStatus")
+    if merge_state in {"DIRTY", "BEHIND", "BLOCKED", "DRAFT", "HAS_HOOKS", "UNKNOWN", "UNSTABLE"}:
+        blockers.append(f"mergeStateStatus={merge_state}")
+    review_decision = pr.get("reviewDecision")
+    if review_decision == "CHANGES_REQUESTED":
+        blockers.append("reviewDecision=CHANGES_REQUESTED")
+
+    checks = pr.get("statusCheckRollup")
+    if isinstance(checks, list):
+        for check in checks:
+            name = check.get("name") or check.get("context") or "status-check"
+            conclusion = check.get("conclusion")
+            if conclusion in {"FAILURE", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE", "ACTION_REQUIRED"}:
+                blockers.append(f"{name}={conclusion}")
+
+    return {
+        "number": pr.get("number"),
+        "title": pr.get("title"),
+        "url": pr.get("url"),
+        "ready": ready,
+        "mergeable": pr.get("mergeable"),
+        "mergeStateStatus": pr.get("mergeStateStatus"),
+        "reviewDecision": pr.get("reviewDecision"),
+        "blockers": blockers,
+    }
+
+
+def summarize_session_close_readiness(session: dict[str, Any], report: dict[str, Any]) -> dict[str, Any]:
+    pull_requests = report.get("pullRequests", [])
+    merged_pull_requests = report.get("mergedPullRequests", [])
+    readiness = [summarize_pr_merge_readiness(pr) for pr in pull_requests]
+    unknown_prs = [pr for pr in pull_requests if pr.get("status") == "unknown"]
+    ready_prs = [item for item in readiness if item.get("ready")]
+
+    close_ready = bool(merged_pull_requests) and report.get("allMerged") and not unknown_prs
+    caution = bool(merged_pull_requests) and (unknown_prs or not report.get("allMerged"))
+
+    return {
+        "closeReady": close_ready,
+        "caution": caution,
+        "hasPullRequest": report.get("hasPullRequest"),
+        "allMerged": report.get("allMerged"),
+        "mergedPullRequestCount": len(merged_pull_requests),
+        "pullRequestCount": len(pull_requests),
+        "unknownPullRequestCount": len(unknown_prs),
+        "mergeReadyPullRequestCount": len(ready_prs),
+        "pullRequestReadiness": readiness,
     }
 
 
@@ -981,10 +1156,67 @@ def check_merge_status(args: argparse.Namespace) -> None:
     print_json({"session": summarize_session_brief(session), "mergeStatus": report})
 
 
+def check_pr_readiness(args: argparse.Namespace) -> None:
+    session_name = normalize_session_name(args.session)
+    session = api_request("GET", f"/{session_name}")
+    report = build_merge_report(session)
+    readiness = [summarize_pr_merge_readiness(pr) for pr in report.get("pullRequests", [])]
+    payload = {
+        "session": summarize_session_brief(session),
+        "pullRequestReadiness": readiness,
+        "allReady": bool(readiness) and all(item["ready"] for item in readiness),
+    }
+    print_json(payload)
+
+
+def request_pr_rework(args: argparse.Namespace) -> None:
+    session_name = normalize_session_name(args.session)
+    session = api_request("GET", f"/{session_name}")
+    report = build_merge_report(session)
+    readiness = [summarize_pr_merge_readiness(pr) for pr in report.get("pullRequests", [])]
+    blocked = [item for item in readiness if not item["ready"]]
+
+    if not blocked:
+        fail("All discovered PRs look merge-ready. No rework request message is needed.")
+
+    lines = [
+        "Please update the open pull request so it becomes merge-ready.",
+        "Address the following issues before finishing:",
+    ]
+    for pr in blocked:
+        title = pr.get("title") or "(untitled PR)"
+        number = pr.get("number")
+        lines.append(f"- PR #{number} {title}")
+        for blocker in pr.get("blockers", []):
+            lines.append(f"  - {blocker}")
+
+    if args.extra_instruction:
+        lines.append(args.extra_instruction.strip())
+
+    message = "\n".join(lines)
+    payload = {
+        "session": summarize_session_brief(session),
+        "pullRequestReadiness": readiness,
+        "message": message,
+    }
+
+    if args.send:
+        api_request("POST", f"/{session_name}:sendMessage", payload={"prompt": message})
+        payload["sent"] = True
+    else:
+        payload["sent"] = False
+
+    if args.markdown:
+        print_text(message)
+        return
+    print_json(payload)
+
+
 def close_merged_session(args: argparse.Namespace) -> None:
     session_name = normalize_session_name(args.session)
     session = api_request("GET", f"/{session_name}")
     report = build_merge_report(session)
+    close_readiness = summarize_session_close_readiness(session, report)
 
     if not report["hasPullRequest"]:
         fail("This session has no pull request URL in its outputs, so merged-close cannot verify it safely.")
@@ -992,6 +1224,8 @@ def close_merged_session(args: argparse.Namespace) -> None:
         fail("No merged pull request was found for this session. Refusing to close it.")
     if args.require_all_merged and not report["allMerged"]:
         fail("Some pull requests for this session are not merged yet. Refusing to close it.")
+    if close_readiness["unknownPullRequestCount"] > 0 and not args.allow_unknown_pr_status:
+        fail("Some pull requests have unknown GitHub status. Refusing to close unless --allow-unknown-pr-status is provided.")
     if args.confirm_close != CLOSE_CONFIRM_TOKEN:
         fail(
             "Merged pull request detected, but close confirmation is missing. "
@@ -1004,6 +1238,7 @@ def close_merged_session(args: argparse.Namespace) -> None:
             "ok": True,
             "deleted": session_name,
             "session": summarize_session_brief(session),
+            "closeReadiness": close_readiness,
             "mergeStatus": report,
         }
     )
@@ -1274,6 +1509,23 @@ def build_parser() -> argparse.ArgumentParser:
     check_merge_parser.add_argument("--session", required=True, help="Session id or sessions/<id> resource name.")
     check_merge_parser.set_defaults(func=check_merge_status)
 
+    check_pr_readiness_parser = subparsers.add_parser(
+        "check-pr-readiness",
+        help="Inspect whether a session's discovered PRs look merge-ready.",
+    )
+    check_pr_readiness_parser.add_argument("--session", required=True, help="Session id or sessions/<id> resource name.")
+    check_pr_readiness_parser.set_defaults(func=check_pr_readiness)
+
+    request_pr_rework_parser = subparsers.add_parser(
+        "request-pr-rework",
+        help="Generate or send a Jules follow-up message when PRs are not merge-ready.",
+    )
+    request_pr_rework_parser.add_argument("--session", required=True, help="Session id or sessions/<id> resource name.")
+    request_pr_rework_parser.add_argument("--extra-instruction", help="Optional extra instruction appended to the rework message.")
+    request_pr_rework_parser.add_argument("--send", action="store_true", help="Send the generated message to Jules immediately.")
+    request_pr_rework_parser.add_argument("--markdown", action="store_true", help="Print only the generated rework message.")
+    request_pr_rework_parser.set_defaults(func=request_pr_rework)
+
     notify_close_parser = subparsers.add_parser(
         "notify-close-plan",
         help="Generate a user-facing confirmation message for a merged session before closing it.",
@@ -1295,6 +1547,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--require-all-merged",
         action="store_true",
         help="Refuse to close unless every discovered PR URL for the session is merged.",
+    )
+    close_merged_parser.add_argument(
+        "--allow-unknown-pr-status",
+        action="store_true",
+        help="Allow close even when some PR statuses could not be resolved from GitHub.",
     )
     close_merged_parser.set_defaults(func=close_merged_session)
 
